@@ -20,6 +20,12 @@ SYNOPSIS
        close W;
        print <R>;
 
+       # redirecting stdin/stdout/stderr (no fork, no fd_inherit needed)
+       pipe my $r, my $w or die;
+       my $pid = spawn3 0, fileno $w, 2, "/bin/echo", ["echo", "captured"];
+       close $w;
+       print <$r>; # "captured\n"
+
 DESCRIPTION
     The purpose of this small (in scope and footprint) module is simple:
     spawn a subprocess asynchronously as efficiently and/or fast as
@@ -73,6 +79,24 @@ FUNCTIONS
     $pid = spawnp $file, \@argv[, \@envp]
         Like "spawn", but searches $file in $ENV{PATH} like the shell would
         do.
+
+    $pid = spawn3 $fd_in, $fd_out, $fd_err, $path, \@argv[, \@envp]
+    $pid = spawn3p $fd_in, $fd_out, $fd_err, $file, \@argv[, \@envp]
+        Like "spawn" / "spawnp", but additionally redirect the child's
+        standard input, output and error onto the given file descriptors
+        before exec: each "$fd_*" is "dup2"'d onto 0, 1 and 2 respectively
+        (a value equal to its target, e.g. 0 for $fd_in, is left untouched,
+        so the child inherits that descriptor unchanged). The source
+        descriptors are then closed in the child, so they do not leak into
+        the executed program.
+
+        This does the redirection without running any Perl in the child (via
+        "posix_spawn" file actions, or "dup2"+exec in the "vfork" child),
+        which is exactly what is needed to redirect a subprocess' stdio when
+        "fork" is unsafe -- for example under a threaded Perl (see the note
+        in "DESCRIPTION" about POSIX threads).
+
+        Not implemented on Windows.
 
     fd_inherit $fileno[, $on]
         File descriptors can be inherited by the spawned processes or not.
