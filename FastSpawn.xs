@@ -58,6 +58,42 @@ array_to_cvec (SV *sv)
   return cvec;
 }
 
+/* Process-wide CreateProcess defaults, set through Proc::FastSpawn::setOptions.
+ *
+ * Nothing is on to begin with, which is the dwCreateFlags of 0 that _spawnve
+ * passed and so what this module has always produced. The names are known on
+ * every platform even though only win32 acts on them, so a misspelling is
+ * caught when developing somewhere the option does nothing. */
+#ifndef WIN32
+  #define CREATE_NO_WINDOW         0
+  #define CREATE_NEW_CONSOLE       0
+  #define DETACHED_PROCESS         0
+  #define CREATE_NEW_PROCESS_GROUP 0
+#endif
+
+enum {
+  OPT_NO_WINDOW,
+  OPT_NEW_CONSOLE,
+  OPT_DETACHED,
+  OPT_NEW_GROUP,
+  OPT_COUNT
+};
+
+#define SPAWN_OPT(name, flag) { name, sizeof (name) - 1, flag }
+
+static const struct {
+  const char   *name;
+  STRLEN        len;
+  unsigned long flag;
+} spawn_opt [OPT_COUNT] = {
+  SPAWN_OPT ("create_no_window",         CREATE_NO_WINDOW        ),
+  SPAWN_OPT ("create_new_console",       CREATE_NEW_CONSOLE      ),
+  SPAWN_OPT ("detached_process",         DETACHED_PROCESS        ),
+  SPAWN_OPT ("create_new_process_group", CREATE_NEW_PROCESS_GROUP)
+};
+
+static int spawn_opt_on [OPT_COUNT];
+
 #ifdef WIN32
 
   #include <io.h> /* _get_osfhandle */
@@ -268,6 +304,20 @@ array_to_cvec (SV *sv)
     return blk;
   }
 
+  /* The dwCreateFlags setOptions has asked for. */
+  static DWORD
+  w32_create_flags (void)
+  {
+    DWORD flags = 0;
+    int i;
+
+    for (i = 0; i < OPT_COUNT; ++i)
+      if (spawn_opt_on [i])
+        flags |= (DWORD)spawn_opt [i].flag;
+
+    return flags;
+  }
+
   /* One CreateProcess for all four entry points.
    *
    * stdh, when given, is the three handles the child should see as 0/1/2;
@@ -292,26 +342,35 @@ array_to_cvec (SV *sv)
     char *cmdline, *envblock = 0, *attrbuf = 0, *fdblock;
     char progbuf [MAX_PATH];
     const char *appname = path;
-    DWORD flags = CREATE_NO_WINDOW;
+    DWORD flags = w32_create_flags ();
     BOOL ok;
 
     for (i = 0; i < 3; ++i)
       {
         hstd [i] = stdh ? stdh [i] : (HANDLE)_get_osfhandle (i);
 
-        if (hstd [i] == INVALID_HANDLE_VALUE)
+        /* STARTF_USESTDHANDLES has to name all three, so a redirect cannot
+         * go ahead with one of them missing. Without it a descriptor the
+         * parent has closed simply stays closed in the child, which is what
+         * _spawnve did and so what spawn/spawnp have always done. */
+        if (hstd [i] == INVALID_HANDLE_VALUE && stdh)
           {
             errno = EBADF;
             return 0;
           }
       }
 
-    /* STARTF_USESTDHANDLES only means anything for inheritable handles.
-     * Remember what each was so the parent is left exactly as found -
-     * duplicates collapse, as the same handle must not be listed twice. */
+    /* A handle the child is to be given has to be inheritable, both for
+     * STARTF_USESTDHANDLES and for the descriptor block, which reports a
+     * handle that is not inheritable as not open. Remember what each was so
+     * the parent is left exactly as found - duplicates collapse, as the same
+     * handle must not be listed twice. */
     for (i = 0; i < 3; ++i)
       {
         int seen = 0;
+
+        if (hstd [i] == INVALID_HANDLE_VALUE)
+          continue;
 
         for (k = 0; k < nlist; ++k)
           if (hlist [k] == hstd [i]) { seen = 1; break; }
@@ -325,11 +384,18 @@ array_to_cvec (SV *sv)
       }
 
     ZeroMemory (&six, sizeof (six));
-    six.StartupInfo.cb          = sizeof (STARTUPINFOA);
-    six.StartupInfo.dwFlags     = STARTF_USESTDHANDLES;
-    six.StartupInfo.hStdInput   = hstd [0];
-    six.StartupInfo.hStdOutput  = hstd [1];
-    six.StartupInfo.hStdError   = hstd [2];
+    six.StartupInfo.cb = sizeof (STARTUPINFOA);
+
+    /* Only when something is really being redirected. spawn/spawnp leave the
+     * standard handles alone, as _spawnve did: the child picks them up from
+     * the descriptor block and from what it inherits. */
+    if (stdh)
+      {
+        six.StartupInfo.dwFlags     = STARTF_USESTDHANDLES;
+        six.StartupInfo.hStdInput   = hstd [0];
+        six.StartupInfo.hStdOutput  = hstd [1];
+        six.StartupInfo.hStdError   = hstd [2];
+      }
 
     /* what lets the child reach these as numbered descriptors */
     fdblock = w32_fdblock (aTHX_ &fdblocksize, hstd, inherit_all, omit);
@@ -444,6 +510,119 @@ array_to_cvec (SV *sv)
 
 #endif
 
+#ifndef WIN32
+
+  /* Keep everything above 0/1/2 back from the child by marking it
+   * close-on-exec for the duration of the spawn, then putting the flags back.
+   * There is no portable file action for "close the rest", and doing it in the
+   * child is not open to us on the vfork path, where only async-signal-safe
+   * calls are allowed and the memory is still shared with us.
+   *
+   * dup2 clears close-on-exec on its target, so the three descriptors spawn3
+   * redirects onto 0/1/2 come through this untouched. */
+  #ifndef MAX_FD_SCAN
+    #define MAX_FD_SCAN 1024
+  #endif
+
+  static int
+  cloexec_hold (pTHX_ int **savep)
+  {
+    int i, n = 0, saved_errno = errno;
+    int *save;
+
+    Newx (save, MAX_FD_SCAN, int);
+
+    for (i = 3; i < MAX_FD_SCAN; ++i)
+      {
+        int f = fcntl (i, F_GETFD);
+
+        if (f < 0 || (f & FD_CLOEXEC))
+          continue;
+
+        if (fcntl (i, F_SETFD, f | FD_CLOEXEC) == 0)
+          save [n++] = i;
+      }
+
+    /* F_GETFD sets EBADF for every descriptor that is not open, and we just
+     * asked about a great many. A caller reading $! after a spawn that worked
+     * should not find "bad file descriptor" waiting there. */
+    errno = saved_errno;
+
+    *savep = save;
+    return n;
+  }
+
+  static void
+  cloexec_release (pTHX_ int *save, int n)
+  {
+    int i, saved_errno = errno;
+
+    for (i = 0; i < n; ++i)
+      {
+        int f = fcntl (save [i], F_GETFD);
+
+        if (f >= 0)
+          fcntl (save [i], F_SETFD, f & ~FD_CLOEXEC);
+      }
+
+    errno = saved_errno;
+    Safefree (save);
+  }
+
+#endif
+
+/* The optional trailing option hash.
+ *
+ * envp may be left out and the hash passed in its place: an option hash and an
+ * environment list are told apart by type, so there is nothing to disambiguate.
+ * When that happens envp is reset to undef, which means "inherit ours".
+ *
+ * Returns the value of "inherit", which defaults on. */
+static int
+spawn_options (pTHX_ SV **envpp, SV *opts)
+{
+  SV *hash = 0;
+  HV *hv;
+  HE *he;
+  int inherit = 1;
+
+  if (SvROK (*envpp) && SvTYPE (SvRV (*envpp)) == SVt_PVHV)
+    {
+      hash   = *envpp;
+      *envpp = &PL_sv_undef;
+    }
+
+  if (SvOK (opts))
+    {
+      if (hash)
+        croak ("Proc::FastSpawn: options given twice");
+
+      if (!SvROK (opts) || SvTYPE (SvRV (opts)) != SVt_PVHV)
+        croak ("Proc::FastSpawn: options must be a hash reference");
+
+      hash = opts;
+    }
+
+  if (!hash)
+    return inherit;
+
+  hv = (HV *)SvRV (hash);
+
+  hv_iterinit (hv);
+  while ((he = hv_iternext (hv)))
+    {
+      STRLEN len;
+      const char *key = HePV (he, len);
+
+      if (len == 7 && memEQ (key, "inherit", 7))
+        inherit = SvTRUE (HeVAL (he));
+      else
+        croak ("Proc::FastSpawn: unknown option %.*s", (int)len, key);
+    }
+
+  return inherit;
+}
+
 /* Build what spawn3/spawn3p hand back: a Proc::FastSpawn::Child carrying the
  * pid and, on Windows, a duplicated process handle. It overloads 0+ and "" to
  * the pid, so callers that just want a pid are unaffected. */
@@ -469,7 +648,7 @@ BOOT:
 #endif
 
 long
-spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
+spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef, SV *opts = &PL_sv_undef)
 	ALIAS:
         spawnp = 1
         INIT:
@@ -492,6 +671,7 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
 	CODE:
 {
 	extern char **environ;
+        int inherit = spawn_options (aTHX_ &envp, opts);
 	char *const *cargv =               array_to_cvec (argv);
 	char *const *cenvp = SvOK (envp) ? array_to_cvec (envp) : environ;
         intptr_t pid;
@@ -508,7 +688,7 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
            * CreateProcess means carrying the descriptor block ourselves, which
            * is what w32_fdblock is for. */
           if (!w32_spawn (aTHX_ path, ix, cargv, cenvp, SvOK (envp),
-                          0, 1, 0, &wpid, &hproc))
+                          0, inherit, 0, &wpid, &hproc))
             XSRETURN_UNDEF;
 
           /* do it like perl, dadadoop dadadoop */
@@ -521,8 +701,15 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
 #elif USE_SPAWN
         {
           pid_t xpid;
+          int *held = 0, nheld = 0;
+
+          if (!inherit)
+            nheld = cloexec_hold (aTHX_ &held);
 
           errno = (ix ? posix_spawnp : posix_spawn) (&xpid, path, 0, 0, cargv, cenvp);
+
+          if (held)
+            cloexec_release (aTHX_ held, nheld);
 
           if (errno)
             XSRETURN_UNDEF;
@@ -530,23 +717,34 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
           pid = xpid;
         }
 #else
-        pid = (ix ? fork : vfork) ();
+        {
+          int *held = 0, nheld = 0;
 
-        if (pid < 0)
-          XSRETURN_UNDEF;
+          if (!inherit)
+            nheld = cloexec_hold (aTHX_ &held);
 
-        if (pid == 0)
-          {
-            if (ix)
-              {
-                environ = (char **)cenvp;
-                execvp (path, cargv);
-              }
-            else
-              execve (path, cargv, cenvp);
+          pid = (ix ? fork : vfork) ();
 
-            _exit (127);
-          }
+          if (pid == 0)
+            {
+              if (ix)
+                {
+                  environ = (char **)cenvp;
+                  execvp (path, cargv);
+                }
+              else
+                execve (path, cargv, cenvp);
+
+              _exit (127);
+            }
+
+          /* parent only: the child is gone through exec, or never was */
+          if (held)
+            cloexec_release (aTHX_ held, nheld);
+
+          if (pid < 0)
+            XSRETURN_UNDEF;
+        }
 #endif
 
         RETVAL = pid;
@@ -554,7 +752,7 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
 	OUTPUT: RETVAL
 
 void
-spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp = &PL_sv_undef)
+spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp = &PL_sv_undef, SV *opts = &PL_sv_undef)
 	ALIAS:
         spawn3p = 1
         INIT:
@@ -577,6 +775,7 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
 	PPCODE:
 {
 	extern char **environ;
+        int inherit = spawn_options (aTHX_ &envp, opts);
 	char *const *cargv =               array_to_cvec (argv);
 	char *const *cenvp = SvOK (envp) ? array_to_cvec (envp) : environ;
         intptr_t pid;
@@ -592,24 +791,34 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
           DWORD wpid;
           HANDLE hproc, hdup;
           HANDLE hstd [3];
+          int redirects = 0;
 
-          /* Resolve the three descriptors. One that is already its own target
-           * means "inherit ours", exactly as on POSIX. */
+          /* A descriptor that is already its own target means "inherit ours",
+           * exactly as on POSIX. If all three are, nothing is being
+           * redirected and this is spawn with a child object on the end: say
+           * so, and the standard handles are left alone rather than being
+           * handed back to the child explicitly, which is the one way the two
+           * could still have differed. */
           for (i = 0; i < 3; ++i)
-            {
-              int fd = rfd [i] >= 0 ? rfd [i] : i;
+            if (rfd [i] >= 0 && rfd [i] != i)
+              redirects = 1;
 
-              hstd [i] = (HANDLE)_get_osfhandle (fd);
+          if (redirects)
+            for (i = 0; i < 3; ++i)
+              {
+                int fd = rfd [i] >= 0 ? rfd [i] : i;
 
-              if (hstd [i] == INVALID_HANDLE_VALUE)
-                {
-                  errno = EBADF;
-                  XSRETURN_UNDEF;
-                }
-            }
+                hstd [i] = (HANDLE)_get_osfhandle (fd);
+
+                if (hstd [i] == INVALID_HANDLE_VALUE)
+                  {
+                    errno = EBADF;
+                    XSRETURN_UNDEF;
+                  }
+              }
 
           if (!w32_spawn (aTHX_ path, ix, cargv, cenvp, SvOK (envp),
-                          hstd, 1, rfd, &wpid, &hproc))
+                          redirects ? hstd : 0, inherit, rfd, &wpid, &hproc))
             XSRETURN_UNDEF;
 
           /* Same bookkeeping spawn does, so waitpid and $? work on the pid. */
@@ -633,6 +842,7 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
         {
           pid_t xpid;
           posix_spawn_file_actions_t fa;
+          int *held = 0, nheld = 0;
 
           posix_spawn_file_actions_init (&fa);
 
@@ -653,9 +863,15 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
                   posix_spawn_file_actions_addclose (&fa, rfd [i]);
               }
 
+          if (!inherit)
+            nheld = cloexec_hold (aTHX_ &held);
+
           errno = (ix ? posix_spawnp : posix_spawn) (&xpid, path, &fa, 0, cargv, cenvp);
 
           posix_spawn_file_actions_destroy (&fa);
+
+          if (held)
+            cloexec_release (aTHX_ held, nheld);
 
           if (errno)
             XSRETURN_UNDEF;
@@ -663,40 +879,51 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
           pid = xpid;
         }
 #else
-        pid = (ix ? fork : vfork) ();
+        {
+          int *held = 0, nheld = 0;
 
-        if (pid < 0)
-          XSRETURN_UNDEF;
+          if (!inherit)
+            nheld = cloexec_hold (aTHX_ &held);
 
-        if (pid == 0)
-          {
-            /* Child. Only async-signal-safe calls here (vfork-safe): dup2/close
-               then exec. dup2 also clears close-on-exec on the targets. */
-            for (i = 0; i < 3; ++i)
-              if (rfd [i] >= 0 && rfd [i] != i)
-                if (dup2 (rfd [i], i) < 0)
-                  _exit (127);
+          pid = (ix ? fork : vfork) ();
 
-            for (i = 0; i < 3; ++i)
-              if (rfd [i] > 2)
+          if (pid == 0)
+            {
+              /* Child. Only async-signal-safe calls here (vfork-safe): dup2/close
+                 then exec. dup2 also clears close-on-exec on the targets. */
+              for (i = 0; i < 3; ++i)
+                if (rfd [i] >= 0 && rfd [i] != i)
+                  if (dup2 (rfd [i], i) < 0)
+                    _exit (127);
+
+              for (i = 0; i < 3; ++i)
+                if (rfd [i] > 2)
+                  {
+                    int seen = 0, k;
+                    for (k = 0; k < i; ++k)
+                      if (rfd [k] == rfd [i]) { seen = 1; break; }
+                    if (!seen)
+                      close (rfd [i]);
+                  }
+
+              if (ix)
                 {
-                  int seen = 0, k;
-                  for (k = 0; k < i; ++k)
-                    if (rfd [k] == rfd [i]) { seen = 1; break; }
-                  if (!seen)
-                    close (rfd [i]);
+                  environ = (char **)cenvp;
+                  execvp (path, cargv);
                 }
+              else
+                execve (path, cargv, cenvp);
 
-            if (ix)
-              {
-                environ = (char **)cenvp;
-                execvp (path, cargv);
-              }
-            else
-              execve (path, cargv, cenvp);
+              _exit (127);
+            }
 
-            _exit (127);
-          }
+          /* parent only: the child is gone through exec, or never was */
+          if (held)
+            cloexec_release (aTHX_ held, nheld);
+
+          if (pid < 0)
+            XSRETURN_UNDEF;
+        }
 #endif
 
         /* ST(0) held fd_in, which has long been copied into a C int */
@@ -724,4 +951,53 @@ fd_inherit (int fd, int on = 1)
 #else
         fcntl (fd, F_SETFD, on ? 0 : FD_CLOEXEC);
 #endif
+
+void
+setOptions (...)
+	PPCODE:
+{
+        int want [OPT_COUNT];
+        int i, k;
+
+        if (items & 1)
+          croak ("Proc::FastSpawn::setOptions: expected a list of key => value pairs");
+
+        Copy (spawn_opt_on, want, OPT_COUNT, int);
+
+        for (i = 0; i < items; i += 2)
+          {
+            STRLEN len;
+            const char *key = SvPV (ST (i), len);
+
+            for (k = 0; k < OPT_COUNT; ++k)
+              if (len == spawn_opt [k].len && memEQ (key, spawn_opt [k].name, len))
+                break;
+
+            if (k == OPT_COUNT)
+              croak ("Proc::FastSpawn::setOptions: unknown option %.*s", (int)len, key);
+
+            want [k] = SvTRUE (ST (i + 1)) ? 1 : 0;
+          }
+
+        /* Reject what CreateProcess would, and do it before anything takes
+         * effect, so a call that does not make sense leaves the settings as
+         * they were rather than half-applying. */
+        if (want [OPT_NEW_CONSOLE] && want [OPT_DETACHED])
+          croak ("Proc::FastSpawn::setOptions: create_new_console and detached_process are mutually exclusive");
+
+        if (want [OPT_NO_WINDOW] && (want [OPT_NEW_CONSOLE] || want [OPT_DETACHED]))
+          croak ("Proc::FastSpawn::setOptions: create_no_window does nothing next to create_new_console or detached_process");
+
+        /* Hand back what was in force, so a caller can put it back. Reading
+         * the arguments is done with, PPCODE pushes over them. */
+        EXTEND (SP, OPT_COUNT * 2);
+
+        for (k = 0; k < OPT_COUNT; ++k)
+          {
+            PUSHs (sv_2mortal (newSVpvn (spawn_opt [k].name, spawn_opt [k].len)));
+            PUSHs (sv_2mortal (newSViv (spawn_opt_on [k])));
+          }
+
+        Copy (want, spawn_opt_on, OPT_COUNT, int);
+}
 

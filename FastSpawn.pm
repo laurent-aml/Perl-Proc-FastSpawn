@@ -28,6 +28,9 @@ Proc::FastSpawn - fork+exec, or spawn, a subprocess as quickly as possible
    print <$r>; # "captured\n"
    waitpid $child, 0; # $child acts as the pid
 
+   # ... and hold everything else back from the child
+   my $child = spawn3 0, fileno $w, 2, "/bin/echo", ["echo", "hi"], { inherit => 0 };
+
 =head1 DESCRIPTION
 
 The purpose of this small (in scope and footprint) module is simple:
@@ -134,7 +137,7 @@ BEGIN {
    XSLoader::load (__PACKAGE__, $VERSION);
 }
 
-=item $pid = spawn $path, \@argv[, \@envp]
+=item $pid = spawn $path, \@argv[, \@envp][, \%options]
 
 Creates a new process and tries to make it execute C<$path>, with the given
 arguments and optionally the given environment variables, similar to
@@ -144,14 +147,14 @@ Returns the PID of the new process if successful. On any error, C<undef>
 is currently returned. Failure to execution might or might not be reported
 as C<undef>, or via a subprocess exit status of C<127>.
 
-=item $pid = spawnp $file, \@argv[, \@envp]
+=item $pid = spawnp $file, \@argv[, \@envp][, \%options]
 
 Like C<spawn>, but searches C<$file> in C<$ENV{PATH}> like the shell would
 do.
 
-=item $child = spawn3  $fd_in, $fd_out, $fd_err, $path, \@argv[, \@envp]
+=item $child = spawn3  $fd_in, $fd_out, $fd_err, $path, \@argv[, \@envp][, \%options]
 
-=item $child = spawn3p $fd_in, $fd_out, $fd_err, $file, \@argv[, \@envp]
+=item $child = spawn3p $fd_in, $fd_out, $fd_err, $file, \@argv[, \@envp][, \%options]
 
 Like C<spawn> / C<spawnp>, but additionally redirect the child's standard
 input, output and error onto the given file descriptors before exec: each
@@ -174,11 +177,105 @@ only hand the child the parent's own descriptors 0, 1 and 2. The three
 descriptors are made inheritable for the duration of the call and put back
 exactly as they were afterwards.
 
-From Vista onwards the child is given those three handles and B<nothing else>.
-On XP on before, all handles marked inheritable are also given.
+The child is created with the same creation flags the C<_spawn> family used,
+which is to say none: it shares the console of whoever spawned it. See
+C<Proc::FastSpawn::setOptions> if you want something else -- in particular if this might run
+somewhere without a console of its own, where a console child would otherwise
+be given a new one, window and all.
 
-The child is created with C<CREATE_NO_WINDOW>, so a console program does not
-flash up a console window. This is not currently overridable.
+=item the options hash
+
+All four functions take an optional hash reference as their last argument. It
+may be given in place of C<\@envp> as well as after it, since an option hash
+and an environment list are told apart by type. Unknown keys are a fatal
+error, so a misspelling does not pass silently.
+
+Only things that mean something on every platform go here, so a spawn call
+never has to be written differently for one operating system. Settings that
+are inherently platform-specific live in C<Proc::FastSpawn::setOptions>
+instead.
+
+There is currently one option:
+
+=over 4
+
+=item inherit => $bool
+
+Whether the child gets the file descriptors above 0, 1 and 2 that this process
+has open. The default is true, which is what these functions have always done.
+
+With C<< inherit => 0 >> the child is held to its three standard descriptors.
+On Windows the others are left out of the descriptor table handed to the child
+and, where the operating system offers it, out of the inherited handle list as
+well. On POSIX they are marked close-on-exec for the duration of the spawn and
+put back as they were afterwards; the three C<spawn3> redirects are unaffected,
+as C<dup2> clears that flag on its target.
+
+This is a blunt instrument: it is "everything or nothing but 0/1/2", not a
+per-descriptor choice. For that, see C<fd_inherit>.
+
+=back
+
+=item %old = Proc::FastSpawn::setOptions key => $value, ...
+
+Sets process-wide defaults for how children are created, and returns the
+settings as they were before the call, as a list of key/value pairs suitable
+for handing straight back. Called with no arguments it changes nothing and
+just reports the current settings.
+
+This is the only call in this module that is about one operating system, and
+deliberately so: the per-call option hash stays portable, and anything that
+only makes sense on Windows is set here, once, by a program that knows how it
+is going to be run.
+
+It is not exported: this changes behaviour for the whole interpreter, so it
+reads better spelled out.
+
+   my %old = Proc::FastSpawn::setOptions (create_no_window => 1);
+   ...
+   Proc::FastSpawn::setOptions (%old);     # put it back
+
+All of these name C<CreateProcess> creation flags and do nothing outside
+Windows, but the names are known everywhere, so a misspelling is caught while
+developing on a platform where the option has no effect. Unknown keys, an odd
+number of arguments, and combinations C<CreateProcess> would reject are all
+fatal; a call that is rejected leaves the settings untouched rather than
+applying half of them.
+
+All default to false, which gives the C<dwCreateFlags> of C<0> that the
+C<_spawn> family passed and that this module has always produced.
+
+=over 4
+
+=item create_no_window => $bool
+
+C<CREATE_NO_WINDOW>. The child gets a console of its own with no window on it.
+Without this the child shares the console of whoever spawned it, and if that
+process has none -- C<wperl>, a service, any GUI program -- Windows gives a
+console child a new console, window and all. Set this if nothing of yours
+should ever put something on the screen.
+
+Note that the child then no longer shares your console, so anything that cares
+about that -- C<CONIN$>, C<GetConsoleWindow>, being in your Ctrl-C group --
+sees a different world. Ordinary standard input, output and error are
+unaffected.
+
+=item detached_process => $bool
+
+C<DETACHED_PROCESS>. The child gets no console at all. It can still make one
+for itself with C<AllocConsole>.
+
+=item create_new_console => $bool
+
+C<CREATE_NEW_CONSOLE>. The child gets a new console with a window, which will
+appear on the screen. Cannot be combined with C<detached_process>.
+
+=item create_new_process_group => $bool
+
+C<CREATE_NEW_PROCESS_GROUP>. The child starts a new process group, so a Ctrl-C
+in your console does not reach it.
+
+=back
 
 =item fd_inherit $fileno[, $on]
 
@@ -237,15 +334,15 @@ On POSIX systems, this module currently calls vfork+exec, spawn, or
 fork+exec, depending on the platform. If your platform has a good vfork or
 spawn but is misdetected and falls back to slow fork+exec, drop Marc a note.
 
-On win32, the C<_spawn> family of functions is used, and the module tries
-hard to patch the new process into perl's internal pid table, so the pid
-returned should work with other Perl functions such as waitpid. Also,
+On win32, C<CreateProcess> is used, and the module tries hard to patch the
+new process into perl's internal pid table, so the pid returned should work
+with other Perl functions such as waitpid. It carries over the descriptor
+table the C runtime passes to a child, so a descriptor the child inherits is
+reachable there by number and not only as one of its standard handles. Also,
 win32 doesn't have a meaningful way to quote arguments containing
 "special" characters, so this module tries it's best to quote those
 strings itself. Other typical platform limitations (such as being able to
 only have 64 or so subprocesses) are not worked around.
-
-That subprocess limit is worth spelling out, because nothing clears it by
 itself: a spawned child occupies a slot in perl's table until it is reaped, and
 on win32 only C<waitpid>, C<wait> and C<kill> drain it -- there is no C<SIGCHLD>
 and nothing reaps in the background. After 64 unreaped children, spawning fails
