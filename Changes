@@ -1,5 +1,23 @@
 Revision history for Perl extension Proc::FastSpawn
 
+1.2.1  Tue Aug  4 00:00:00 UTC 2026
+	- add spawn3/spawn3p: spawn with stdin/stdout/stderr redirection.
+	  A descriptor that already its own target is left alone, so they
+          are a superset of spawn/spawnp.
+	- spawn3/spawn3p return a Proc::FastSpawn::Child rather than a bare
+	  pid. It behaves as a pid and carries the process handle an event
+          loop needs on win32.
+	- win32: spawn/spawnp go through CreateProcess rather than the _spawn
+	  family, which offered no way to reach the creation flags.
+	- win32: from vista on, the child is given only the handles it was
+	  meant to get, rather than every inheritable handle in the process.
+	- an optional trailing option hash. inherit => 0 holds the child to
+	  0, 1 and 2, which otherwise needed fd_inherit on every descriptor
+	  in turn.
+	- setOptions sets the process-wide CreateProcess defaults, so a
+	  program can ask for CREATE_NO_WINDOW once at startup instead of
+	  having it imposed. The defaults are what the _spawn family passed.
+
 1.2  Mon Jun 10 05:02:10 CEST 2013
         - do not use vfork with spawnp, to avoid running into lots of
           problems (execvp might call malloc, better thread safety etc.),

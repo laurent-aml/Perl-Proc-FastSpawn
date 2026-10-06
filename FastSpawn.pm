@@ -127,7 +127,7 @@ sub DESTROY {
 package Proc::FastSpawn;
 
 BEGIN {
-   $VERSION = '1.2';
+   $VERSION = '1.2.1';
 
    our @ISA = qw(Exporter);
    our @EXPORT = qw(spawn spawnp spawn3 spawn3p fd_inherit);
