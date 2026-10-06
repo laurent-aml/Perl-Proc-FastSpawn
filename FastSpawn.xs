@@ -177,6 +177,271 @@ array_to_cvec (SV *sv)
       }
   }
 
+  /* The CRT's inherited descriptor block, for STARTUPINFO.lpReserved2.
+   *
+   * CreateProcess passes inheritable HANDLEs to the child, but nothing tells
+   * the child's CRT which descriptor number each one should be, so a child
+   * cannot reach them as fds - "open '<&3'" fails. _spawnve passes this block,
+   * which is how that works today; since we no longer go through _spawnve (it
+   * offers no way to ask for CREATE_NO_WINDOW), we build it ourselves.
+   *
+   * Layout is a CRT implementation detail rather than documented API, but it
+   * has been the same since msvcrt and is still what UCRT reads: an int count,
+   * then count flag bytes, then count HANDLEs.
+   *
+   * A descriptor whose handle is not inheritable is passed as "not open"
+   * rather than with its handle. _spawnve hands the handle over regardless,
+   * and the child's startup then faults on a handle it was never given, which
+   * is what makes fd_inherit($fd, 0) kill the child instead of merely hiding
+   * the descriptor from it. */
+  #define W32_FOPEN      0x01
+  #define W32_FPIPE      0x08
+  #define W32_FDEV       0x40
+
+  /* How far up the descriptor table to look for things to pass on. */
+  #ifndef W32_MAX_FD
+    #define W32_MAX_FD 1024
+  #endif
+
+  static char *
+  w32_fdblock (pTHX_ DWORD *sizep, HANDLE const *stdh, int inherit_all,
+               int const *omit)
+  {
+    int i, count = 3, saved_errno = errno;
+    char *blk, *flags;
+    HANDLE *handles;
+
+    /* _get_osfhandle sets EBADF for every descriptor that is not open, and the
+     * scan below asks about a great many. Leaving that behind would have a
+     * caller inspecting $! after a spawn that succeeded read "bad file
+     * descriptor", so put errno back as we found it. */
+    if (inherit_all)
+      for (i = 3; i < W32_MAX_FD; ++i)
+        if ((HANDLE)_get_osfhandle (i) != INVALID_HANDLE_VALUE)
+          count = i + 1;
+
+    errno = saved_errno;
+
+    *sizep = (DWORD)(sizeof (int) + count * (sizeof (char) + sizeof (HANDLE)));
+    Newxz (blk, *sizep, char);
+
+    *(int *)blk = count;
+    flags       = blk + sizeof (int);
+    handles     = (HANDLE *)(flags + count);
+
+    for (i = 0; i < count; ++i)
+      {
+        HANDLE h = i < 3 && stdh ? stdh [i] : (HANDLE)_get_osfhandle (i);
+        DWORD hf, type;
+
+        /* A descriptor that was redirected onto 0/1/2 is gone from the child,
+         * as it is on POSIX, where the file actions close it. Leaving it would
+         * also hand the same HANDLE out under two numbers, and closing either
+         * would then invalidate the other. */
+        if (i > 2 && omit
+            && (i == omit [0] || i == omit [1] || i == omit [2]))
+          {
+            flags   [i] = 0;
+            handles [i] = INVALID_HANDLE_VALUE;
+            continue;
+          }
+
+        /* unopened, or one the child will not be given: say "not open" */
+        if (h == INVALID_HANDLE_VALUE || h == 0
+            || !GetHandleInformation (h, &hf)
+            || !(hf & HANDLE_FLAG_INHERIT))
+          {
+            flags   [i] = 0;
+            handles [i] = INVALID_HANDLE_VALUE;
+            continue;
+          }
+
+        flags [i] = W32_FOPEN;
+
+        type = GetFileType (h);
+        if (type == FILE_TYPE_CHAR)      flags [i] |= W32_FDEV;
+        else if (type == FILE_TYPE_PIPE) flags [i] |= W32_FPIPE;
+
+        handles [i] = h;
+      }
+
+    return blk;
+  }
+
+  /* One CreateProcess for all four entry points.
+   *
+   * stdh, when given, is the three handles the child should see as 0/1/2;
+   * without it the child gets the parent's own. inherit_all asks for the
+   * historical behaviour - every inheritable handle goes to the child - and
+   * when it is off the child is held to 0/1/2 alone.
+   *
+   * Returns 1 and fills *pidp/*hprocp, or 0 with errno set. */
+  static int
+  w32_spawn (pTHX_ const char *path, int search,
+             char *const *cargv, char *const *cenvp, int have_envp,
+             HANDLE const *stdh, int inherit_all,
+             int const *omit,
+             DWORD *pidp, HANDLE *hprocp)
+  {
+    STARTUPINFOEXA six;
+    PROCESS_INFORMATION pi;
+    HANDLE hstd [3], hlist [3];
+    DWORD oldflags [3], fdblocksize;
+    int have_old [3];
+    int nlist = 0, i, k;
+    char *cmdline, *envblock = 0, *attrbuf = 0, *fdblock;
+    char progbuf [MAX_PATH];
+    const char *appname = path;
+    DWORD flags = CREATE_NO_WINDOW;
+    BOOL ok;
+
+    for (i = 0; i < 3; ++i)
+      {
+        hstd [i] = stdh ? stdh [i] : (HANDLE)_get_osfhandle (i);
+
+        if (hstd [i] == INVALID_HANDLE_VALUE)
+          {
+            errno = EBADF;
+            return 0;
+          }
+      }
+
+    /* STARTF_USESTDHANDLES only means anything for inheritable handles.
+     * Remember what each was so the parent is left exactly as found -
+     * duplicates collapse, as the same handle must not be listed twice. */
+    for (i = 0; i < 3; ++i)
+      {
+        int seen = 0;
+
+        for (k = 0; k < nlist; ++k)
+          if (hlist [k] == hstd [i]) { seen = 1; break; }
+
+        if (seen)
+          continue;
+
+        have_old [nlist] = GetHandleInformation (hstd [i], &oldflags [nlist]) ? 1 : 0;
+        SetHandleInformation (hstd [i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        hlist [nlist++] = hstd [i];
+      }
+
+    ZeroMemory (&six, sizeof (six));
+    six.StartupInfo.cb          = sizeof (STARTUPINFOA);
+    six.StartupInfo.dwFlags     = STARTF_USESTDHANDLES;
+    six.StartupInfo.hStdInput   = hstd [0];
+    six.StartupInfo.hStdOutput  = hstd [1];
+    six.StartupInfo.hStdError   = hstd [2];
+
+    /* what lets the child reach these as numbered descriptors */
+    fdblock = w32_fdblock (aTHX_ &fdblocksize, hstd, inherit_all, omit);
+    six.StartupInfo.lpReserved2 = (LPBYTE)fdblock;
+    six.StartupInfo.cbReserved2 = (WORD)fdblocksize;
+
+    #ifdef HAVE_W32_ATTRLIST
+    /* Only when the caller asked to keep the rest back: with inheritance left
+     * open there is nothing to restrict, and the list would cost a heap
+     * allocation per spawn for nothing. */
+    if (!inherit_all)
+      {
+        w32_attr_resolve ();
+
+        if (w32_attr_init)
+          {
+            SIZE_T attrsize = 0;
+
+            /* the sizing call is expected to fail, it only sets attrsize */
+            w32_attr_init (0, 1, 0, &attrsize);
+            Newx (attrbuf, attrsize, char);
+
+            if (w32_attr_init ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf, 1, 0, &attrsize)
+                && w32_attr_update ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf, 0,
+                                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                    hlist, nlist * sizeof (HANDLE), 0, 0))
+              {
+                six.StartupInfo.cb      = sizeof (STARTUPINFOEXA);
+                six.lpAttributeList     = (LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf;
+                flags                  |= EXTENDED_STARTUPINFO_PRESENT;
+              }
+            else
+              {
+                Safefree (attrbuf);
+                attrbuf = 0;
+              }
+          }
+      }
+    #endif
+
+    cmdline = w32_cmdline (aTHX_ cargv);
+
+    if (have_envp)
+      envblock = w32_envblock (aTHX_ cenvp);
+
+    if (search)
+      {
+        /* resolve through PATH ourselves rather than letting CreateProcess
+         * parse it out of the command line, which would search for argv[0]
+         * instead of the file we were given */
+        DWORD n = SearchPathA (0, path, ".exe", sizeof (progbuf), progbuf, 0);
+
+        if (!n || n >= sizeof (progbuf))
+          {
+            for (k = 0; k < nlist; ++k)
+              if (have_old [k])
+                SetHandleInformation (hlist [k], HANDLE_FLAG_INHERIT,
+                                      oldflags [k] & HANDLE_FLAG_INHERIT);
+            #ifdef HAVE_W32_ATTRLIST
+            if (attrbuf)
+              {
+                w32_attr_delete ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf);
+                Safefree (attrbuf);
+              }
+            #endif
+            Safefree (fdblock);
+            Safefree (cmdline);
+            if (envblock)
+              Safefree (envblock);
+
+            errno = ENOENT;
+            return 0;
+          }
+
+        appname = progbuf;
+      }
+
+    ok = CreateProcessA ((char *)appname, cmdline, 0, 0, TRUE, flags,
+                         envblock, 0, &six.StartupInfo, &pi);
+
+    /* put the parent's handles back the way they were */
+    for (k = 0; k < nlist; ++k)
+      if (have_old [k])
+        SetHandleInformation (hlist [k], HANDLE_FLAG_INHERIT,
+                              oldflags [k] & HANDLE_FLAG_INHERIT);
+
+    #ifdef HAVE_W32_ATTRLIST
+    if (attrbuf)
+      {
+        w32_attr_delete ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf);
+        Safefree (attrbuf);
+      }
+    #endif
+    Safefree (fdblock);
+    Safefree (cmdline);
+    if (envblock)
+      Safefree (envblock);
+
+    if (!ok)
+      {
+        w32_set_errno ();
+        return 0;
+      }
+
+    CloseHandle (pi.hThread);
+
+    *pidp   = pi.dwProcessId;
+    *hprocp = pi.hProcess;
+
+    return 1;
+  }
+
 #endif
 
 /* Build what spawn3/spawn3p hand back: a Proc::FastSpawn::Child carrying the
@@ -233,16 +498,26 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef)
 
         fflush (0);
 #ifdef WIN32
-        pid = (ix ? _spawnvpe : _spawnve) (_P_NOWAIT, path, cargv, cenvp);
+        {
+          DWORD wpid;
+          HANDLE hproc;
 
-        if (pid == -1)
-          XSRETURN_UNDEF;
+          /* Not _spawnve any more: it gives no way to ask for CREATE_NO_WINDOW,
+           * so a console child spawned from a perl without a console of its own
+           * - wperl, a service - popped a console window. Going through
+           * CreateProcess means carrying the descriptor block ourselves, which
+           * is what w32_fdblock is for. */
+          if (!w32_spawn (aTHX_ path, ix, cargv, cenvp, SvOK (envp),
+                          0, 1, 0, &wpid, &hproc))
+            XSRETURN_UNDEF;
 
-        /* do it like perl, dadadoop dadadoop */
-        w32_child_handles [w32_num_children] = (HANDLE)pid;
-        pid = GetProcessId ((HANDLE)pid); /* get the real pid, unfortunately, requires wxp or newer */
-        w32_child_pids [w32_num_children] = pid;
-        ++w32_num_children;
+          /* do it like perl, dadadoop dadadoop */
+          w32_child_handles [w32_num_children] = hproc;
+          w32_child_pids    [w32_num_children] = wpid;
+          ++w32_num_children;
+
+          pid = wpid;
+        }
 #elif USE_SPAWN
         {
           pid_t xpid;
@@ -314,17 +589,9 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
         fflush (0);
 #ifdef WIN32
         {
-          STARTUPINFOEXA six;
-          PROCESS_INFORMATION pi;
-          HANDLE hstd [3], hlist [3], hdup;
-          DWORD oldflags [3];
-          int have_old [3];
-          int nlist = 0, k;
-          char *cmdline, *envblock = 0, *attrbuf = 0;
-          char progbuf [MAX_PATH];
-          const char *appname = path;
-          DWORD flags = CREATE_NO_WINDOW;
-          BOOL ok;
+          DWORD wpid;
+          HANDLE hproc, hdup;
+          HANDLE hstd [3];
 
           /* Resolve the three descriptors. One that is already its own target
            * means "inherit ours", exactly as on POSIX. */
@@ -341,118 +608,26 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
                 }
             }
 
-          /* STARTF_USESTDHANDLES only means anything for inheritable handles.
-           * Remember what each was so the parent is left exactly as found -
-           * duplicates collapse, as the same handle must not be listed twice. */
-          for (i = 0; i < 3; ++i)
-            {
-              int seen = 0;
-
-              for (k = 0; k < nlist; ++k)
-                if (hlist [k] == hstd [i]) { seen = 1; break; }
-
-              if (seen)
-                continue;
-
-              have_old [nlist] = GetHandleInformation (hstd [i], &oldflags [nlist]) ? 1 : 0;
-              SetHandleInformation (hstd [i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-              hlist [nlist++] = hstd [i];
-            }
-
-          ZeroMemory (&six, sizeof (six));
-          six.StartupInfo.cb          = sizeof (STARTUPINFOA);
-          six.StartupInfo.dwFlags     = STARTF_USESTDHANDLES;
-          six.StartupInfo.hStdInput   = hstd [0];
-          six.StartupInfo.hStdOutput  = hstd [1];
-          six.StartupInfo.hStdError   = hstd [2];
-
-          #ifdef HAVE_W32_ATTRLIST
-          w32_attr_resolve ();
-
-          if (w32_attr_init)
-            {
-              SIZE_T attrsize = 0;
-
-              /* the sizing call is expected to fail, it only sets attrsize */
-              w32_attr_init (0, 1, 0, &attrsize);
-              Newx (attrbuf, attrsize, char);
-
-              if (w32_attr_init ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf, 1, 0, &attrsize)
-                  && w32_attr_update ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf, 0,
-                                      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                      hlist, nlist * sizeof (HANDLE), 0, 0))
-                {
-                  six.StartupInfo.cb      = sizeof (STARTUPINFOEXA);
-                  six.lpAttributeList     = (LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf;
-                  flags                  |= EXTENDED_STARTUPINFO_PRESENT;
-                }
-              else
-                {
-                  Safefree (attrbuf);
-                  attrbuf = 0;
-                }
-            }
-          #endif
-
-          cmdline = w32_cmdline (aTHX_ cargv);
-
-          if (SvOK (envp))
-            envblock = w32_envblock (aTHX_ cenvp);
-
-          if (ix)
-            {
-              /* spawn3p: resolve through PATH ourselves rather than letting
-               * CreateProcess parse it out of the command line, which would
-               * search for argv[0] instead of the file we were given. */
-              DWORD n = SearchPathA (0, path, ".exe", sizeof (progbuf), progbuf, 0);
-
-              appname = (n > 0 && n < sizeof (progbuf)) ? progbuf : 0;
-            }
-
-          ok = CreateProcessA ((char *)appname, cmdline, 0, 0, TRUE, flags,
-                               envblock, 0, &six.StartupInfo, &pi);
-
-          /* put the parent's handles back the way they were */
-          for (k = 0; k < nlist; ++k)
-            if (have_old [k])
-              SetHandleInformation (hlist [k], HANDLE_FLAG_INHERIT,
-                                    oldflags [k] & HANDLE_FLAG_INHERIT);
-
-          #ifdef HAVE_W32_ATTRLIST
-          if (attrbuf)
-            {
-              w32_attr_delete ((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf);
-              Safefree (attrbuf);
-            }
-          #endif
-          Safefree (cmdline);
-          if (envblock)
-            Safefree (envblock);
-
-          if (!ok)
-            {
-              w32_set_errno ();
-              XSRETURN_UNDEF;
-            }
-
-          CloseHandle (pi.hThread);
+          if (!w32_spawn (aTHX_ path, ix, cargv, cenvp, SvOK (envp),
+                          hstd, 1, rfd, &wpid, &hproc))
+            XSRETURN_UNDEF;
 
           /* Same bookkeeping spawn does, so waitpid and $? work on the pid. */
-          w32_child_handles [w32_num_children] = pi.hProcess;
-          w32_child_pids    [w32_num_children] = pi.dwProcessId;
+          w32_child_handles [w32_num_children] = hproc;
+          w32_child_pids    [w32_num_children] = wpid;
           ++w32_num_children;
 
           /* The caller gets its own reference: perl closes the one above when
            * the child is reaped, and a handle being waited on must not vanish
            * underneath the waiter. Not inheritable, or it would leak into every
            * subsequent child spawned with handle inheritance on. */
-          if (!DuplicateHandle (GetCurrentProcess (), pi.hProcess,
+          if (!DuplicateHandle (GetCurrentProcess (), hproc,
                                 GetCurrentProcess (), &hdup,
                                 0, FALSE, DUPLICATE_SAME_ACCESS))
             hdup = 0;
 
           hchild = hdup;
-          pid    = pi.dwProcessId;
+          pid    = wpid;
         }
 #elif USE_SPAWN
         {
