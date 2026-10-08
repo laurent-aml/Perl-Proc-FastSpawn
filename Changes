@@ -2,7 +2,7 @@ Revision history for Perl extension Proc::FastSpawn
 
 1.2.1  Tue Aug  4 00:00:00 UTC 2026
 	- add spawn3/spawn3p: spawn with stdin/stdout/stderr redirection.
-	  A descriptor that already its own target is left alone, so they
+	  A descriptor that is already its own target is left alone, so they
           are a superset of spawn/spawnp.
 	- spawn3/spawn3p return a Proc::FastSpawn::Child rather than a bare
 	  pid. It behaves as a pid and carries the process handle an event
