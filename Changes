@@ -1,5 +1,14 @@
 Revision history for Perl extension Proc::FastSpawn
 
+1.2.2  Thu Oct  8 00:00:00 UTC 2026
+	- a "dir" option: the directory the child runs in, honoured by all
+	  four. A relative program path is resolved against it here, in the
+	  parent, so that changing directory in the child (posix) and
+	  lpCurrentDirectory (win32, which resolves the program against the
+	  parent's directory) mean the same thing. Where the directory can
+	  only be changed by the child, a bad one is exit 126 rather than a
+	  failed spawn, 127 being a failed exec.
+
 1.2.1  Tue Aug  4 00:00:00 UTC 2026
 	- add spawn3/spawn3p: spawn with stdin/stdout/stderr redirection.
 	  A descriptor that is already its own target is left alone, so they

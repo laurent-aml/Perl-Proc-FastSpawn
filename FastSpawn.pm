@@ -159,7 +159,7 @@ sub _resolve {
 }
 
 BEGIN {
-   $VERSION = '1.2.1';
+   $VERSION = '1.2.2';
 
    our @ISA = qw(Exporter);
    our @EXPORT = qw(spawn spawnp spawn3 spawn3p fd_inherit);
