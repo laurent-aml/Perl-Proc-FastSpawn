@@ -126,6 +126,38 @@ sub DESTROY {
 
 package Proc::FastSpawn;
 
+# Resolve a relative program path against the directory the child will run in,
+# here in the parent, so that both ways of honouring "dir" agree. chdir-then-exec
+# resolves a relative path against the new directory, while win32's
+# lpCurrentDirectory sets the child's directory but still resolves the program
+# against the *parent's*. Doing it once, before either, picks the first meaning
+# everywhere. Only called when "dir" is given.
+#
+# A bare name with no separator is left alone for spawnp/spawn3p: that is a PATH
+# lookup, which is execvp's own rule for telling the two apart.
+use constant WIN32 => $^O eq "MSWin32";
+
+sub _resolve {
+   my ($path, $dir, $search) = @_;
+
+   require File::Spec;
+
+   return $path if File::Spec->file_name_is_absolute ($path);
+
+   # index rather than a match: this is on the path of every spawn that gives a
+   # directory. The backslash is only a separator on windows, where an absolute
+   # path is caught above but a relative one - sub\helper.exe - would otherwise
+   # look like a bare name and be sent to PATH instead of being resolved. On
+   # POSIX it is an ordinary character in a filename, so testing for it there
+   # would resolve "weird\name" against the directory where execvp, finding no
+   # slash, would search PATH. The constant folds the test away off windows.
+   return $path if $search
+                   && index ($path, "/") < 0
+                   && (!WIN32 || index ($path, "\\") < 0);
+
+   File::Spec->rel2abs ($path, $dir)
+}
+
 BEGIN {
    $VERSION = '1.2.1';
 
@@ -213,6 +245,37 @@ as C<dup2> clears that flag on its target.
 
 This is a blunt instrument: it is "everything or nothing but 0/1/2", not a
 per-descriptor choice. For that, see C<fd_inherit>.
+
+=item dir => $path
+
+The directory the child runs in. The default is to inherit the parent process's.
+How a bad directory is reported differs by platform - see below.
+
+If the program path given to the spawn is relative, it is resolved against this
+directory B<before the spawn>, in the parent process. On POSIX the directory is
+changed in the child before C<exec>, so a relative program would resolve against
+the new directory, while Windows sets the child's directory but still resolves
+the program against the I<parent> process's. Resolving once, here, means both
+mean the same thing. For C<spawnp> and C<spawn3p>, a bare name with no directory
+separator is left alone, since that is a C<PATH> lookup rather than a path - the
+same rule C<execvp> uses.
+
+B<Failure reporting depends on the platform>. The usual case - a directory that is
+not there - is the one that differs. Where the directory is applied by the
+operating system as part of creating the process, failing to apply it fails the
+spawn, so these functions return C<undef> with C<$!> set, as for any other
+failure: that is Windows, and POSIX systems where C<posix_spawn> is used and
+provides C<posix_spawn_file_actions_addchdir_np>.
+
+Everywhere else - which is most systems, including Linux - the directory is
+changed by the child itself, after the process already exists and the parent
+already holds its PID. There is no way to report it back: the only signal is the
+child's exit status. It exits B<126> when the directory could not be changed to,
+as against B<127> for a program that could not be executed, following the shell
+convention, so the two can at least be told apart.
+
+On a system that has neither mechanism, C<dir> croaks rather than being quietly
+ignored.
 
 =back
 

@@ -29,6 +29,16 @@
     #if _POSIX_SPAWN >= 200809L
       #define USE_SPAWN 1
       #include <spawn.h>
+
+      /* posix_spawn_file_actions_addchdir_np is the only way to honour "dir"
+       * on this path: glibc 2.29, musl 1.1.24, macOS 10.15. Older ones have no
+       * hook that runs in the child at all, so "dir" is refused there rather
+       * than quietly ignored. */
+      #if (defined (__GLIBC__) && defined (__GLIBC_PREREQ) && __GLIBC_PREREQ (2, 29)) \
+          || (defined (__APPLE__) && defined (__MAC_OS_X_VERSION_MIN_REQUIRED) \
+              && __MAC_OS_X_VERSION_MIN_REQUIRED >= 101500)
+        #define HAVE_SPAWN_ADDCHDIR 1
+      #endif
     #else
       #define vfork() fork()
     #endif
@@ -330,7 +340,7 @@ static int spawn_opt_on [OPT_COUNT];
   w32_spawn (pTHX_ const char *path, int search,
              char *const *cargv, char *const *cenvp, int have_envp,
              HANDLE const *stdh, int inherit_all,
-             int const *omit,
+             int const *omit, const char *dir,
              DWORD *pidp, HANDLE *hprocp)
   {
     STARTUPINFOEXA six;
@@ -473,8 +483,10 @@ static int spawn_opt_on [OPT_COUNT];
         appname = progbuf;
       }
 
+    /* lpCurrentDirectory. The program itself was already resolved against it
+     * in the parent, so this only sets where the child runs. */
     ok = CreateProcessA ((char *)appname, cmdline, 0, 0, TRUE, flags,
-                         envblock, 0, &six.StartupInfo, &pi);
+                         envblock, (char *)dir, &six.StartupInfo, &pi);
 
     /* put the parent's handles back the way they were */
     for (k = 0; k < nlist; ++k)
@@ -577,14 +589,17 @@ static int spawn_opt_on [OPT_COUNT];
  * environment list are told apart by type, so there is nothing to disambiguate.
  * When that happens envp is reset to undef, which means "inherit ours".
  *
- * Returns the value of "inherit", which defaults on. */
+ * Returns the value of "inherit", which defaults on, and sets *dirp to the
+ * value of "dir" - the directory the child is to run in - or leaves it null. */
 static int
-spawn_options (pTHX_ SV **envpp, SV *opts)
+spawn_options (pTHX_ SV **envpp, SV *opts, const char **dirp)
 {
   SV *hash = 0;
   HV *hv;
   HE *he;
   int inherit = 1;
+
+  *dirp = 0;
 
   if (SvROK (*envpp) && SvTYPE (SvRV (*envpp)) == SVt_PVHV)
     {
@@ -616,11 +631,51 @@ spawn_options (pTHX_ SV **envpp, SV *opts)
 
       if (len == 7 && memEQ (key, "inherit", 7))
         inherit = SvTRUE (HeVAL (he));
+      else if (len == 3 && memEQ (key, "dir", 3))
+        {
+          SV *v = HeVAL (he);
+
+          /* the hash is the caller's, so the string outlives this call */
+          *dirp = SvOK (v) ? SvPV_nolen (v) : 0;
+        }
       else
         croak ("Proc::FastSpawn: unknown option %.*s", (int)len, key);
     }
 
   return inherit;
+}
+
+/* Resolve a relative program path against "dir", in the parent, before either
+ * way of honouring it runs - see Proc::FastSpawn::_resolve for why. Returns a
+ * new SV the caller owns, or 0 to leave the path alone. */
+static SV *
+resolve_path (pTHX_ const char *path, const char *dir, int search)
+{
+  SV *out = 0;
+  int n;
+  dSP;
+
+  ENTER;
+  SAVETMPS;
+
+  PUSHMARK (SP);
+  EXTEND (SP, 3);
+  PUSHs (sv_2mortal (newSVpv (path, 0)));
+  PUSHs (sv_2mortal (newSVpv (dir,  0)));
+  PUSHs (sv_2mortal (newSViv (search)));
+  PUTBACK;
+
+  n = call_pv ("Proc::FastSpawn::_resolve", G_SCALAR);
+
+  SPAGAIN;
+  if (n > 0)
+    out = newSVsv (POPs);
+  PUTBACK;
+
+  FREETMPS;
+  LEAVE;
+
+  return out;
 }
 
 /* Build what spawn3/spawn3p hand back: a Proc::FastSpawn::Child carrying the
@@ -671,9 +726,21 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef, SV *opts = &PL_sv_un
 	CODE:
 {
 	extern char **environ;
-        int inherit = spawn_options (aTHX_ &envp, opts);
-	char *const *cargv =               array_to_cvec (argv);
-	char *const *cenvp = SvOK (envp) ? array_to_cvec (envp) : environ;
+        const char *dir;
+        int inherit = spawn_options (aTHX_ &envp, opts, &dir);
+	char *const *cargv;
+	char *const *cenvp;
+
+        if (dir)
+          {
+            SV *rp = resolve_path (aTHX_ path, dir, ix);
+
+            if (rp)
+              path = SvPV_nolen (sv_2mortal (rp));
+          }
+
+        cargv =               array_to_cvec (argv);
+        cenvp = SvOK (envp) ? array_to_cvec (envp) : environ;
         intptr_t pid;
 
         fflush (0);
@@ -688,7 +755,7 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef, SV *opts = &PL_sv_un
            * CreateProcess means carrying the descriptor block ourselves, which
            * is what w32_fdblock is for. */
           if (!w32_spawn (aTHX_ path, ix, cargv, cenvp, SvOK (envp),
-                          0, inherit, 0, &wpid, &hproc))
+                          0, inherit, 0, dir, &wpid, &hproc))
             XSRETURN_UNDEF;
 
           /* do it like perl, dadadoop dadadoop */
@@ -702,11 +769,27 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef, SV *opts = &PL_sv_un
         {
           pid_t xpid;
           int *held = 0, nheld = 0;
+          posix_spawn_file_actions_t fa;
+          posix_spawn_file_actions_t *fap = 0;
 
           if (!inherit)
             nheld = cloexec_hold (aTHX_ &held);
 
-          errno = (ix ? posix_spawnp : posix_spawn) (&xpid, path, 0, 0, cargv, cenvp);
+          if (dir)
+            {
+              #ifdef HAVE_SPAWN_ADDCHDIR
+                posix_spawn_file_actions_init (&fa);
+                posix_spawn_file_actions_addchdir_np (&fa, dir);
+                fap = &fa;
+              #else
+                croak ("Proc::FastSpawn: dir is not supported on this platform");
+              #endif
+            }
+
+          errno = (ix ? posix_spawnp : posix_spawn) (&xpid, path, fap, 0, cargv, cenvp);
+
+          if (fap)
+            posix_spawn_file_actions_destroy (fap);
 
           if (held)
             cloexec_release (aTHX_ held, nheld);
@@ -727,6 +810,13 @@ spawn (const char *path, SV *argv, SV *envp = &PL_sv_undef, SV *opts = &PL_sv_un
 
           if (pid == 0)
             {
+              /* chdir is async-signal-safe, like the dup2/close above, so it
+               * is no more than this child already does. The parent is long
+               * gone by now, though: a bad dir can only be reported as an exit
+               * status, and 126 rather than 127 tells it from a failed exec. */
+              if (dir && chdir (dir) < 0)
+                _exit (126);
+
               if (ix)
                 {
                   environ = (char **)cenvp;
@@ -775,9 +865,21 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
 	PPCODE:
 {
 	extern char **environ;
-        int inherit = spawn_options (aTHX_ &envp, opts);
-	char *const *cargv =               array_to_cvec (argv);
-	char *const *cenvp = SvOK (envp) ? array_to_cvec (envp) : environ;
+        const char *dir;
+        int inherit = spawn_options (aTHX_ &envp, opts, &dir);
+	char *const *cargv;
+	char *const *cenvp;
+
+        if (dir)
+          {
+            SV *rp = resolve_path (aTHX_ path, dir, ix);
+
+            if (rp)
+              path = SvPV_nolen (sv_2mortal (rp));
+          }
+
+        cargv =               array_to_cvec (argv);
+        cenvp = SvOK (envp) ? array_to_cvec (envp) : environ;
         intptr_t pid;
         void *hchild = 0;
         int rfd [3];
@@ -818,7 +920,7 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
               }
 
           if (!w32_spawn (aTHX_ path, ix, cargv, cenvp, SvOK (envp),
-                          redirects ? hstd : 0, inherit, rfd, &wpid, &hproc))
+                          redirects ? hstd : 0, inherit, rfd, dir, &wpid, &hproc))
             XSRETURN_UNDEF;
 
           /* Same bookkeeping spawn does, so waitpid and $? work on the pid. */
@@ -850,6 +952,16 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
           for (i = 0; i < 3; ++i)
             if (rfd [i] >= 0 && rfd [i] != i)
               posix_spawn_file_actions_adddup2 (&fa, rfd [i], i);
+
+          if (dir)
+            {
+              #ifdef HAVE_SPAWN_ADDCHDIR
+                posix_spawn_file_actions_addchdir_np (&fa, dir);
+              #else
+                posix_spawn_file_actions_destroy (&fa);
+                croak ("Proc::FastSpawn: dir is not supported on this platform");
+              #endif
+            }
 
           /* close the (duplicated) source fds; skip duplicate values so we do
              not close the same fd twice (which would fail the spawn). */
@@ -905,6 +1017,13 @@ spawn3 (int fd_in, int fd_out, int fd_err, const char *path, SV *argv, SV *envp 
                     if (!seen)
                       close (rfd [i]);
                   }
+
+              /* chdir is async-signal-safe, like the dup2/close above, so it
+               * is no more than this child already does. The parent is long
+               * gone by now, though: a bad dir can only be reported as an exit
+               * status, and 126 rather than 127 tells it from a failed exec. */
+              if (dir && chdir (dir) < 0)
+                _exit (126);
 
               if (ix)
                 {
